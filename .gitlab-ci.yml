@@ -1,0 +1,87 @@
+stages:
+  - check
+  - security
+  - deploy
+
+variables:
+  TOOLS_IMAGE: "repos-harbor-privé.fr/devops/pythontools:latest"
+
+# ---------------------------------------------------
+# STAGE 1 : CHECK (Qualité & Style) test11
+# ---------------------------------------------------
+ruff-lint:
+  stage: check
+  image: $TOOLS_IMAGE
+  script:
+    - pip install ruff --root-user-action ignore
+    - ruff check .
+  rules:
+    - when: always
+
+# ---------------------------------------------------
+# STAGE 2 : SECURITY (dépendances + code)
+# ---------------------------------------------------
+gitleaks:
+  stage: security
+  image: $TOOLS_IMAGE
+  before_script:
+    - curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz | tar -xz -C /usr/local/bin gitleaks
+  script:
+    - gitleaks detect --source . -c .gitleaks.toml --verbose --redact
+  rules:
+    - when: always 
+
+sast-semgrep:
+  stage: security
+  image: returntocorp/semgrep
+  script:
+    - semgrep scan --config auto --error .
+  rules:
+    - when: always 
+# ---------------------------------------------------
+# JOB 2 : DEPLOY que sur main
+# ---------------------------------------------------
+deploy-to-srv:
+  stage: deploy
+  image: repos-harbor-privé.fr/infra/teleport-ci:light
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: teleport.exemple.fr
+  script:
+    - |
+      set -e
+      if [ -z "$TELEPORT_PROXY" ]; then echo "ERREUR: TELEPORT_PROXY vide"; exit 1; fi
+      mkdir -p /tmp/tbot
+
+      # 1. Configuration de tbot
+      cat <<EOF > tbot-config.yaml
+      version: v2
+      instance_addr: ${TELEPORT_PROXY}
+      onboarding:
+        join_method: gitlab
+        token: gitlab-oidc-token
+      storage:
+        type: memory
+      outputs:
+        - type: identity
+          destination:
+            type: directory
+            path: /tmp/tbot
+      EOF
+
+      # 2. Login
+      export TBOT_GITLAB_JWT="${GITLAB_OIDC_TOKEN}"
+      tbot start -c tbot-config.yaml --oneshot
+      export TELEPORT_AUTH=local
+
+      # 3. Préparation (Le bot s'ouvre les droits tout seul)
+      echo "🔧 Préparation du dossier cible sur ${TARGET_SERVER}..."
+      tsh ssh -i /tmp/tbot/identity --proxy=${TELEPORT_PROXY} ${TARGET_SERVER} "sudo mkdir -p /srv/test2 && sudo chown deployer:deployer /srv/test2"
+
+      # 4. Transfert via SCP
+      echo "📦 Transfert SCP..."
+      tsh scp -i /tmp/tbot/identity --proxy=${TELEPORT_PROXY} -r ./* ${TARGET_SERVER}:/srv/test2/
+      
+      echo ":white_check_mark: Livraison terminée !"
